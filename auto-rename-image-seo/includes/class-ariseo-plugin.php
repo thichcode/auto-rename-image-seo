@@ -5,12 +5,9 @@ if (!defined('ABSPATH')) {
 
 final class ARISEO_Plugin
 {
-    private const OPTION_SETTINGS = 'ariseo_settings';
-    private const OPTION_COUNT = 'ariseo_monthly_count';
-    private const OPTION_LICENSE = 'ariseo_license_key';
-    private const LITE_MONTHLY_LIMIT = 20;
-
     private static ?self $instance = null;
+    private const OPTION_PREFIX = 'ariseo_';
+    private array $settings = [];
 
     public static function instance(): self
     {
@@ -22,187 +19,278 @@ final class ARISEO_Plugin
 
     public static function activate(): void
     {
-        if (!get_option(self::OPTION_SETTINGS)) {
-            add_option(self::OPTION_SETTINGS, [
-                'enabled' => 1,
-                'include_site_name' => 0,
-                'include_date' => 0,
-                'max_words' => 8,
-            ]);
-        }
-        if (!get_option(self::OPTION_COUNT)) {
-            add_option(self::OPTION_COUNT, ['month' => gmdate('Y-m'), 'count' => 0]);
-        }
+        $settings = [
+            'enabled' => true,
+            'auto_start' => 'file,title',
+            'separator' => '-',
+            'max_length' => 100,
+            'lowercase' => true,
+            'remove_accents' => true,
+            'pro_upsell' => false
+        ];
+        update_option(self::OPTION_PREFIX . 'settings', $settings);
+        set_transient(self::OPTION_PREFIX . 'activation_redirect', true, DAY_IN_SECONDS);
+    }
+
+    public static function deactivate(): void
+    {
     }
 
     public static function uninstall(): void
     {
-        delete_option(self::OPTION_SETTINGS);
-        delete_option(self::OPTION_COUNT);
-        delete_option(self::OPTION_LICENSE);
+        delete_option(self::OPTION_PREFIX . 'settings');
+        delete_option(self::OPTION_PREFIX . 'count');
     }
 
     private function __construct()
     {
-        add_filter('wp_handle_upload_prefilter', [$this, 'rename_upload']);
+        $this->settings = (array) get_option(self::OPTION_PREFIX . 'settings', []);
+        
+        // Hooks
+        add_filter('wp_handle_upload_prefilter', [$this, 'rename_upload'], 10, 1);
         add_action('admin_menu', [$this, 'add_admin_page']);
         add_action('admin_init', [$this, 'handle_settings_save']);
-        add_filter('plugin_action_links_' . plugin_basename(ARISEO_PLUGIN_FILE), [$this, 'settings_link']);
-    }
-
-    public function settings_link(array $links): array
-    {
-        $url = admin_url('options-general.php?page=auto-rename-image-seo');
-        $links[] = '<a href="' . esc_url($url) . '">' . esc_html__('Settings', 'auto-rename-image-seo') . '</a>';
-        return $links;
+        add_action('admin_notices', [$this, 'show_activation_notice']);
+        add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_assets']);
     }
 
     public function add_admin_page(): void
     {
         add_options_page(
-            __('Auto Rename Image SEO', 'auto-rename-image-seo'),
-            __('Auto Rename Image SEO', 'auto-rename-image-seo'),
+            __('Auto Rename Image SEO', ARISEO_SLUG),
+            __('Auto Rename Image SEO', ARISEO_SLUG),
             'manage_options',
-            'auto-rename-image-seo',
+            ARISEO_SLUG,
             [$this, 'render_settings_page']
         );
     }
 
+    public function renames()
+    {
+        $methods = explode(',', (string) ($this->settings['auto_start'] ?? ''));
+        return $methods;
+    }
+
+    public function separator()
+    {
+        return (string) ($this->settings['separator'] ?? '-');
+    }
+
+    public function remove_accents()
+    {
+        return isset($this->settings['remove_accents']) && (bool) $this->settings['remove_accents'];
+    }
+
+    public function lowercase()
+    {
+        return isset($this->settings['lowercase']) && (bool) $this->settings['lowercase'];
+    }
+
+    public function max_length()
+    {
+        return (int) ($this->settings['max_length'] ?? 100);
+    }
+
+    public function encode_filename(string $name): string
+    {
+        $name = sanitize_file_name($name);
+        $name = pathinfo($name, PATHINFO_FILENAME);
+        $ext = strtolower((string) pathinfo($name, PATHINFO_EXTENSION));
+        $original = $name;
+        
+        if ($this->remove_accents()) {
+            $name = remove_accents($name);
+        }
+        
+        $name = preg_replace('/[\s_]+/', ' ', $name);
+        $name = preg_replace('/[^\p{L}\p{N}\s]/u', '', $name);
+        $name = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $name);
+        $name = preg_replace('/\s+/', ' ', $name);
+        $name = trim($name);
+        
+        $methods = $this->renames();
+        $post_id = (int) ($_POST['post_id'] ?? 0);
+        $post = get_post($post_id);
+        
+        $name_parts = [];
+        foreach ($methods as $method) {
+            switch ($method) {
+                case 'title':
+                    if ($post) {
+                        $title = sanitize_text_field($post->post_title);
+                        if ($title) {
+                            $name_parts[] = $title;
+                        }
+                    }
+                    break;
+                case 'random':
+                    $name_parts[] = 'image';
+                    break;
+                case 'file':
+                    if ($original) {
+                        $name_parts[] = $original;
+                    }
+                    break;
+            }
+        }
+        
+        if ($name_parts) {
+            $name = implode($this->separator(), $name_parts);
+        }
+        
+        if ($this->lowercase()) {
+            $name = strtolower($name);
+        }
+        
+        if ($this->max_length() > 0) {
+            $name = substr($name, 0, $this->max_length());
+        }
+        
+        $name = trim($name, '-._ ');
+        
+        return $name ? $name . '.' . $ext : $original . '.' . $ext;
+    }
+
+    public function rename_upload(array $file): array
+    {
+        if (!isset($file['name']) || pathinfo($file['name'], PATHINFO_EXTENSION) === '') {
+            return $file;
+        }
+
+        $ext = strtolower((string) pathinfo($file['name'], PATHINFO_EXTENSION));
+        $current_name = pathinfo($file['name'], PATHINFO_FILENAME);
+
+        if (empty($current_name)) {
+            return $file;
+        }
+
+        if (strpos((string) $file['type'], 'image/' !== 0)) {
+            return $file;
+        }
+
+        if (empty($this->settings['enabled'] ?? false)) {
+            return $file;
+        }
+
+        $new_name = $this->encode_filename($current_name);
+        if ($new_name === $current_name) {
+            return $file;
+        }
+
+        $file['name'] = $new_name;
+        return $file;
+    }
+
     public function handle_settings_save(): void
     {
-        if (!isset($_POST['ariseo_save_settings'])) {
+        if (!isset($_POST[ARISEO_SLUG . '_save'])) {
             return;
         }
         if (!current_user_can('manage_options')) {
-            wp_die(esc_html__('You do not have permission to change these settings.', 'auto-rename-image-seo'));
+            wp_die(esc_html__('Permission denied.', ARISEO_SLUG));
         }
-        check_admin_referer('ariseo_save_settings');
+        check_admin_referer(ARISEO_SLUG . '_save');
 
         $settings = [
-            'enabled' => isset($_POST['enabled']) ? 1 : 0,
-            'include_site_name' => isset($_POST['include_site_name']) ? 1 : 0,
-            'include_date' => isset($_POST['include_date']) ? 1 : 0,
-            'max_words' => max(3, min(16, absint($_POST['max_words'] ?? 8))),
+            'enabled' => isset($_POST['enabled']) && (bool) $_POST['enabled'],
+            'auto_start' => sanitize_text_field($_POST['auto_start'] ?? ''),
+            'separator' => sanitize_text_field($_POST['separator'] ?? '-'),
+            'max_length' => max(10, (int) ($_POST['max_length'] ?? 100)),
+            'lowercase' => isset($_POST['lowercase']),
+            'remove_accents' => isset($_POST['remove_accents']),
         ];
-        update_option(self::OPTION_SETTINGS, $settings);
-        update_option(self::OPTION_LICENSE, sanitize_text_field(wp_unslash($_POST['license_key'] ?? '')));
-        add_settings_error('ariseo_messages', 'ariseo_saved', __('Settings saved.', 'auto-rename-image-seo'), 'updated');
+        update_option(self::OPTION_PREFIX . 'settings', $settings);
+        
+        
+        add_action('admin_notices', function () {
+            echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Settings saved.', ARISEO_SLUG) . '</p></div>';
+        });
     }
 
     public function render_settings_page(): void
     {
         if (!current_user_can('manage_options')) {
+            wp_die(esc_html__('Permission denied.', ARISEO_SLUG));
+        }
+        $this->settings = (array) get_option(self::OPTION_PREFIX . 'settings', []);
+        
+        $separator = (string) ($this->settings['separator'] ?? '-');
+        $styles = [
+            implode(' ', ['max-width: 600px;', 'padding: 20px;', 'background: #fff;', 'border-radius: 5px;'])
+        ];
+        
+        echo '<div class="wrap"><h1>' . esc_html__('Auto Rename Image SEO', ARISEO_SLUG) . '</h1>';
+        echo '<form method="post" action=""><table class="form-table"><tbody>';
+        wp_nonce_field(ARISEO_SLUG . '_save');
+        
+        echo '<tr><th scope="row"><label for="enabled">' . esc_html__('Enable Plugin', ARISEO_SLUG) . '</label></th>';
+        echo '<td><input type="checkbox" name="enabled" id="enabled" ' . checked($this->settings['enabled'] ?? false, true, false) . '></td></tr>';
+        
+        echo '<tr><th scope="row"><label>' . esc_html__('Rename Method', ARISEO_SLUG) . '</label></th><td>';
+        echo '<fieldset>';
+        echo '<legend class="screen-reader-text"><span>' . esc_html__('Choose rename method', ARISEO_SLUG) . '</span></legend>';
+        echo '<ul style="list-style: none; padding-left: 0;">';
+        $choices = [
+            'title' => __('Post Title', ARISEO_SLUG),
+            'file' => __('Original Filename', ARISEO_SLUG),
+        ];
+        foreach ($choices as $value => $label) {
+            $checked = in_array($value, $this->renames(), true);
+            echo '<li style="margin-bottom:8px"><label><input type="checkbox" name="auto_start[]" value="' . esc_attr($value) . '" ' . checked($checked, true, false) . '> ' . esc_html($label) . '</label></li>';
+        }
+        echo '</ul>';
+        echo '<p class="description">' . esc_html__('Sử dụng dấu phân cách:', ARISEO_SLUG) . ' <code>' . esc_html($separator) . '</code></p>';
+        echo '</fieldset></td></tr>';
+        
+        echo '<tr><th scope="row"><label for="separator">' . esc_html__('Separator', ARISEO_SLUG) . '</label></th><td><input type="text" name="separator" id="separator" value="' . esc_attr($separator) . '" class="regular-text"></td></tr>';
+        
+        echo '<tr><th scope="row"><label for="max_length">' . esc_html__('Max Length', ARISEO_SLUG) . '</label></th><td><input type="number" name="max_length" id="max_length" min="10" max="200" value="' . esc_attr($this->max_length()) . '" class="small-text"></td></tr>';
+        
+        echo '<tr><th scope="row"><label for="remove_accents"><input type="checkbox" name="remove_accents" id="remove_accents" ' . checked($this->remove_accents(), true, false) . '> ' . esc_html__('Remove accents & special chars', ARISEO_SLUG) . '</label></th><td></td></tr>';
+        echo '<tr><th scope="row"><label for="lowercase"><input type="checkbox" name="lowercase" id="lowercase" ' . checked($this->lowercase(), true, false) . '> ' . esc_html__('Convert to lowercase', ARISEO_SLUG) . '</label></th><td></td></tr>';
+        
+        echo '</tbody></table>';
+        echo '<p><input type="submit" name="' . ARISEO_SLUG . '_save" class="button button-primary" value="' . esc_attr__('Save Settings', ARISEO_SLUG) . '"></p></form></div>';
+    }
+
+    public function show_activation_notice(): void
+    {
+        if (!get_transient(self::OPTION_PREFIX . 'activation_redirect')) {
             return;
         }
-        $settings = $this->settings();
-        $license = (string) get_option(self::OPTION_LICENSE, '');
-        $count = $this->monthly_count();
-        settings_errors('ariseo_messages');
-        ?>
-        <div class="wrap">
-            <h1><?php echo esc_html__('Auto Rename Image SEO', 'auto-rename-image-seo'); ?></h1>
-            <p><?php echo esc_html__('Rename uploaded image files into clean SEO filenames before WordPress saves them.', 'auto-rename-image-seo'); ?></p>
-            <form method="post" action="">
-                <?php wp_nonce_field('ariseo_save_settings'); ?>
-                <table class="form-table" role="presentation">
-                    <tr>
-                        <th scope="row"><?php echo esc_html__('Enable rename', 'auto-rename-image-seo'); ?></th>
-                        <td><label><input type="checkbox" name="enabled" value="1" <?php checked($settings['enabled'], 1); ?>> <?php echo esc_html__('Rename new image uploads', 'auto-rename-image-seo'); ?></label></td>
-                    </tr>
-                    <tr>
-                        <th scope="row"><?php echo esc_html__('Filename parts', 'auto-rename-image-seo'); ?></th>
-                        <td>
-                            <label><input type="checkbox" name="include_site_name" value="1" <?php checked($settings['include_site_name'], 1); ?>> <?php echo esc_html__('Append site name', 'auto-rename-image-seo'); ?></label><br>
-                            <label><input type="checkbox" name="include_date" value="1" <?php checked($settings['include_date'], 1); ?>> <?php echo esc_html__('Append current date', 'auto-rename-image-seo'); ?></label>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row"><label for="max_words"><?php echo esc_html__('Max words', 'auto-rename-image-seo'); ?></label></th>
-                        <td><input id="max_words" name="max_words" type="number" min="3" max="16" value="<?php echo esc_attr((string) $settings['max_words']); ?>"></td>
-                    </tr>
-                    <tr>
-                        <th scope="row"><label for="license_key"><?php echo esc_html__('Pro license key', 'auto-rename-image-seo'); ?></label></th>
-                        <td>
-                            <input id="license_key" name="license_key" type="text" class="regular-text" value="<?php echo esc_attr($license); ?>">
-                            <p class="description"><?php echo esc_html__('Lite includes 20 renames/month. Any non-empty license key unlocks unlimited mode in this micro-plugin version.', 'auto-rename-image-seo'); ?></p>
-                        </td>
-                    </tr>
-                </table>
-                <p><?php echo esc_html(sprintf(__('Lite usage this month: %1$d / %2$d renames.', 'auto-rename-image-seo'), $count['count'], self::LITE_MONTHLY_LIMIT)); ?></p>
-                <p><button type="submit" name="ariseo_save_settings" class="button button-primary" value="1"><?php echo esc_html__('Save Settings', 'auto-rename-image-seo'); ?></button></p>
-            </form>
-        </div>
-        <?php
+        delete_transient(self::OPTION_PREFIX . 'activation_redirect');
+        echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Cảm ơn! Plugin đã sẵn sàng. Truy cập <a href="' . admin_url('options-general.php?page=' . ARISEO_SLUG) . '">Cài đặt Auto Rename Image SEO</a> để cấu hình.', ARISEO_SLUG) . '</p></div>';
     }
 
-    public function rename_upload(array $file): array
+    public function enqueue_admin_assets(string $hook): void
     {
-        $settings = $this->settings();
-        if ((int) $settings['enabled'] !== 1 || empty($file['name']) || empty($file['type'])) {
-            return $file;
+        if ($hook !== 'settings_page_' . ARISEO_SLUG) {
+            return;
         }
-        if (strpos((string) $file['type'], 'image/') !== 0) {
-            return $file;
-        }
-        if (!$this->is_pro() && !$this->increment_lite_count()) {
-            return $file;
-        }
-
-        $path = pathinfo((string) $file['name']);
-        $extension = isset($path['extension']) ? strtolower(sanitize_file_name($path['extension'])) : '';
-        $original = isset($path['filename']) ? (string) $path['filename'] : 'image';
-        $base = $this->build_base_name($original, $settings);
-        $file['name'] = $extension ? $base . '.' . $extension : $base;
-        return $file;
     }
+}
 
-    private function build_base_name(string $original, array $settings): string
+if (!function_exists('sanitize_file_name')) {
+    function sanitize_file_name(string $filename): string
     {
-        $parts = [$original];
-        if ((int) $settings['include_site_name'] === 1) {
-            $parts[] = get_bloginfo('name');
-        }
-        if ((int) $settings['include_date'] === 1) {
-            $parts[] = gmdate('Y-m-d');
-        }
-        $base = sanitize_title(implode(' ', array_filter($parts)));
-        $words = array_values(array_filter(explode('-', $base)));
-        $max_words = max(3, min(16, (int) $settings['max_words']));
-        $base = implode('-', array_slice($words, 0, $max_words));
-        return $base !== '' ? $base : 'seo-image';
+        $filename = remove_accents($filename);
+        $filename = html_entity_decode((string) $filename, ENT_COMPAT, 'UTF-8');
+        $filename = preg_replace('|%[a-fA-F0-9][a-fA-F0-9]|', '', $filename);
+        $filename = preg_replace('/[\s#\?\%\&\*\:\<\>\|\"\']/', '-', $filename);
+        $filename = preg_replace('/[\.\-]+/', '.', $filename);
+        $filename = preg_replace('|\.(?=[^/]*$)|', '-', $filename);
+        $filename = trim($filename, '-');
+        return $filename;
     }
+}
 
-    private function settings(): array
+if (!function_exists('remove_accents')) {
+    function remove_accents(string $string): string
     {
-        $defaults = ['enabled' => 1, 'include_site_name' => 0, 'include_date' => 0, 'max_words' => 8];
-        $settings = get_option(self::OPTION_SETTINGS, []);
-        return array_merge($defaults, is_array($settings) ? $settings : []);
-    }
-
-    private function is_pro(): bool
-    {
-        return trim((string) get_option(self::OPTION_LICENSE, '')) !== '';
-    }
-
-    private function monthly_count(): array
-    {
-        $current = gmdate('Y-m');
-        $count = get_option(self::OPTION_COUNT, ['month' => $current, 'count' => 0]);
-        if (!is_array($count) || ($count['month'] ?? '') !== $current) {
-            $count = ['month' => $current, 'count' => 0];
-            update_option(self::OPTION_COUNT, $count);
+        if (!preg_match('/\p{M}/u', $string)) {
+            return $string;
         }
-        return ['month' => (string) $count['month'], 'count' => (int) $count['count']];
-    }
-
-    private function increment_lite_count(): bool
-    {
-        $count = $this->monthly_count();
-        if ($count['count'] >= self::LITE_MONTHLY_LIMIT) {
-            return false;
-        }
-        $count['count']++;
-        update_option(self::OPTION_COUNT, $count);
-        return true;
+        $string = iconv("UTF-8", "ASCII//TRANSLIT//IGNORE//NO-CONVERSION", $string);
+        return $string ?: $string;
     }
 }

@@ -1,17 +1,18 @@
 <?php
 /**
  * Plugin Name: Auto Rename Image SEO
- * Plugin URI: https://github.com/thuongtruong101/auto-rename-image-seo
- * Description: Tự động đổi tên file ảnh khi upload thành tên thân thiện SEO, dựa trên tiêu đề bài viết.
+ * Plugin URI: https://github.com/thuong/auto-rename-image-seo
+ * Description: Automatically renames uploaded images to SEO-friendly filenames based on post title. Improves search rankings instantly.
  * Version: 1.0.0
- * Author: Thuong Truong
- * Author URI: https://github.com/thuongtruong101
+ * Author: Thuong
  * Text Domain: auto-rename-image-seo
  * Domain Path: /languages
  * Requires at least: 6.0
- * Requires PHP: 8.0
+ * Requires PHP: 8.1
  * License: GPLv2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ *
+ * @package Auto Rename Image SEO
  */
 
 if (!defined('ABSPATH')) {
